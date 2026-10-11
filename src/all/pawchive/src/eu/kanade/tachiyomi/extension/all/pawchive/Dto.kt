@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.double
+import org.jsoup.nodes.Element
 import kotlin.time.Instant
 
 @Serializable
@@ -103,4 +104,26 @@ class PawchivePostDto(
 @Serializable
 class PawchiveFileDto(val path: String = "") {
     override fun toString() = path
+}
+
+/** A post card scraped from /posts, /posts?tag=... or /posts/popular. */
+class PawchivePostCardDto(
+    val service: String,
+    val user: String,
+    val id: String,
+    val title: String,
+    val thumbnail: String?,
+) {
+    companion object {
+        fun from(element: Element): PawchivePostCardDto? {
+            val service = element.attr("data-service").ifBlank { return null }
+            val user = element.attr("data-user").ifBlank { return null }
+            val id = element.attr("data-id").ifBlank { return null }
+            val title = element.selectFirst(".post-card__header")?.text().orEmpty()
+            val thumbnail = element.selectFirst("img.post-card__image")
+                ?.absUrl("src")
+                ?.takeIf { it.isNotBlank() }
+            return PawchivePostCardDto(service, user, id, title, thumbnail)
+        }
+    }
 }

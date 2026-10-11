@@ -15,6 +15,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.Dispatchers
@@ -98,6 +99,38 @@ abstract class Pawchive :
     // ============================== Search ===============================
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        var mode = MODE_CREATORS
+        var tag = ""
+        var tagPick = ""
+        var period = "day"
+        var date = ""
+        var ai = ""
+
+        filters.forEach { filter ->
+            when (filter) {
+                is SearchModeFilter -> mode = filter.state
+                is TagFilter -> tag = filter.state.trim()
+                is TagListFilter -> tagPick = filter.getValue()
+                is PopularPeriodFilter -> period = filter.getValue()
+                is PopularDateFilter -> date = filter.state.trim()
+                is AiFilter -> ai = filter.getValue()
+                else -> {}
+            }
+        }
+
+        val finalTag = tag.ifEmpty { tagPick }
+        if (mode == MODE_CREATORS && finalTag.isNotEmpty()) mode = MODE_POSTS
+
+        return when (mode) {
+            MODE_POSTS -> searchPosts(page, query, finalTag, ai)
+            MODE_POPULAR -> popularPosts(page, query, period, date)
+            else -> searchCreators(page, query, filters)
+        }
+    }
+
+    // ------------------------------ Creators ------------------------------
+
+    private suspend fun searchCreators(page: Int, query: String, filters: FilterList): MangasPage {
         var sort: Pair<String, String> = "" to ""
         val typeIncluded = mutableListOf<String>()
         val typeExcluded = mutableListOf<String>()
@@ -145,17 +178,7 @@ abstract class Pawchive :
                 }
             }
 
-            val creatorsDeferred = async(Dispatchers.IO) {
-                val url = "$baseUrl/$apiPath/creators"
-                val cacheControl = CacheControl.Builder().maxStale(30.minutes).build()
-
-                apiClient.get(url, cacheControl).use { response ->
-                    if (!response.isSuccessful) {
-                        throw Exception("HTTP error ${response.code}")
-                    }
-                    response.parseAs<List<PawchiveCreatorDto>>()
-                }
-            }
+            val creatorsDeferred = async(Dispatchers.IO) { fetchCreators() }
 
             val favorites = favoritesDeferred.await()
             val allCreators = creatorsDeferred.await()
@@ -204,31 +227,123 @@ abstract class Pawchive :
         return MangasPage(final, hasNextPage)
     }
 
+    // ------------------------------- Posts --------------------------------
+
+    private suspend fun searchPosts(page: Int, query: String, tag: String, ai: String): MangasPage {
+        val q = query.trim()
+        if (q.isNotEmpty() && q.length < 2) {
+            throw Exception("Post search needs at least 2 characters")
+        }
+
+        val url = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegment("posts")
+            .apply {
+                if (q.isNotEmpty()) addQueryParameter("q", q)
+                if (tag.isNotEmpty()) addQueryParameter("tag", tag)
+                if (ai.isNotEmpty()) addQueryParameter(ai, "ai")
+                if (page > 1) addQueryParameter("o", ((page - 1) * PAGE_POST_LIMIT).toString())
+            }
+            .build()
+
+        return fetchPostCards(url.toString(), null)
+    }
+
+    private suspend fun popularPosts(page: Int, query: String, period: String, date: String): MangasPage {
+        if (date.isNotEmpty() && !DATE_REGEX.matches(date)) {
+            throw Exception("Invalid date. Use the format YYYY-MM-DD")
+        }
+
+        val url = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("posts/popular")
+            .addQueryParameter("period", period)
+            .apply {
+                if (date.isNotEmpty()) addQueryParameter("date", date)
+                if (page > 1) addQueryParameter("o", ((page - 1) * PAGE_POST_LIMIT).toString())
+            }
+            .build()
+
+        // The popular page has no text search, so the query filters the loaded titles.
+        return fetchPostCards(url.toString(), query.trim().ifEmpty { null })
+    }
+
+    private suspend fun fetchPostCards(url: String, titleFilter: String?): MangasPage {
+        val (document, creators) = coroutineScope {
+            val documentDeferred = async(Dispatchers.IO) { apiClient.get(url).asJsoup() }
+            val creatorsDeferred = async(Dispatchers.IO) {
+                // Only used to resolve creator names; posts still show if this fails.
+                runCatching { fetchCreators() }.getOrDefault(emptyList())
+            }
+            documentDeferred.await() to creatorsDeferred.await()
+        }
+
+        val creatorMap = creators.associateBy { "${it.service}/${it.id}" }
+
+        val mangas = document.select("article.post-card")
+            .mapNotNull { PawchivePostCardDto.from(it) }
+            .filter { titleFilter == null || it.title.contains(titleFilter, true) }
+            .distinctBy { "${it.service}/${it.user}" }
+            .map { card ->
+                val creator = creatorMap["${card.service}/${card.user}"]
+                SManga.create().apply {
+                    this.url = "/${card.service}/user/${card.user}"
+                    title = creator?.name ?: "${card.service.serviceName()} ${card.user}"
+                    author = card.service.serviceName()
+                    thumbnail_url = card.thumbnail ?: "$baseUrl/icons/${card.service}/${card.user}"
+                    description = PROMPT
+                    initialized = true
+                }
+            }
+
+        val hasNextPage = document.selectFirst("a.next") != null
+        return MangasPage(mangas, hasNextPage)
+    }
+
+    private suspend fun fetchCreators(): List<PawchiveCreatorDto> {
+        val url = "$baseUrl/$apiPath/creators"
+        val cacheControl = CacheControl.Builder().maxStale(30.minutes).build()
+
+        return apiClient.get(url, cacheControl).use { response ->
+            if (!response.isSuccessful) {
+                throw Exception("HTTP error ${response.code}")
+            }
+            response.parseAs<List<PawchiveCreatorDto>>()
+        }
+    }
+
+    // ------------------------------- By URL -------------------------------
+
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) {
             return null
         }
 
-        if (url.pathSegments.firstOrNull() != "creators" || url.pathSegments.size < 2) {
-            return null
+        val segments = url.pathSegments
+        val service: String?
+        val id: String
+
+        when {
+            // Legacy form: /creators/{id}
+            segments.firstOrNull() == "creators" && segments.size >= 2 -> {
+                service = null
+                id = segments[1]
+            }
+            // Site form: /{service}/user/{id} and /{service}/user/{id}/post/{postId}
+            segments.size >= 3 && segments[1] == "user" -> {
+                service = segments[0]
+                id = segments[2]
+            }
+            else -> return null
         }
 
-        val id = url.pathSegments[1]
         if (id.isBlank()) {
             return null
         }
 
-        val cache = CacheControl.Builder().maxStale(30.minutes).build()
-        val url = "$baseUrl/$apiPath/creators"
+        val creator = runCatching { fetchCreators() }.getOrNull()
+            ?.find { it.id == id && (service == null || it.service == service) }
+            ?: return null
 
-        return apiClient.get(url, cache, ensureSuccess = false).use { response ->
-            if (!response.isSuccessful) {
-                return null
-            }
-            val allCreators = response.parseAs<List<PawchiveCreatorDto>>()
-            val creator = allCreators.find { it.id == id } ?: return null
-            creator.toSManga(baseUrl)
-        }
+        return creator.toSManga(baseUrl)
     }
 
     // ============================== Details ==============================
@@ -356,6 +471,7 @@ abstract class Pawchive :
     companion object {
         private const val PAGE_POST_LIMIT = 50
         private const val PAGE_CREATORS_LIMIT = 50
+        private val DATE_REGEX = Regex("""\d{4}-\d{2}-\d{2}""")
         const val PROMPT = "You can change how many posts to load in the extension preferences."
 
         private const val POST_PAGES_PREF = "POST_PAGES"
