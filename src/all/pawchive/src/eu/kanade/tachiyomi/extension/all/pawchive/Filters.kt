@@ -17,8 +17,9 @@ val getSortsList: List<Pair<String, String>> = listOf(
 const val MODE_CREATORS = 0
 const val MODE_POSTS = 1
 const val MODE_POPULAR = 2
+const val MODE_SIMILAR = 3
 
-val getSearchModes = arrayOf("Creators", "Posts", "Popular posts")
+val getSearchModes = arrayOf("Creators", "Posts", "Popular posts", "Similar artists")
 
 val getPopularPeriods: List<Pair<String, String>> = listOf(
     Pair("Day", "day"),
@@ -55,6 +56,8 @@ class SearchModeFilter : Filter.Select<String>("Search in", getSearchModes, MODE
 
 class TagFilter : Filter.Text("Tag (exact name)")
 
+class SimilarFilter : Filter.Text("Similar artists: creator link or service/id")
+
 class TagListFilter : Filter.Select<String>("Common tags", (listOf("None") + getCommonTags).toTypedArray()) {
     fun getValue() = if (state == 0) "" else getCommonTags[state - 1]
 }
@@ -71,9 +74,11 @@ class AiFilter : Filter.Select<String>("AI-generated posts", getAiOptions.map { 
 
 private fun postFilters(): List<Filter<*>> = listOf(
     SearchModeFilter(),
-    Filter.Header("Posts / Popular posts: results are grouped by creator. Setting a tag switches to Posts automatically."),
+    Filter.Header("Posts / Popular posts: each result is a single post. A tag switches to Posts automatically."),
+    Filter.Header("Similar artists: paste a creator link or e.g. fanbox/37736420 here or in the search box."),
     TagFilter(),
     TagListFilter(),
+    SimilarFilter(),
     AiFilter(),
     PopularPeriodFilter(),
     PopularDateFilter(),

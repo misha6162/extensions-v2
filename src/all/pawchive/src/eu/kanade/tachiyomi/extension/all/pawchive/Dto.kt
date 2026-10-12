@@ -4,7 +4,10 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.double
 import org.jsoup.nodes.Element
 import kotlin.time.Instant
@@ -50,16 +53,23 @@ class PawchiveCreatorDto(
 
 @Serializable
 class PawchivePostDto(
-    private val id: String,
-    private val service: String,
-    private val user: String,
-    private val title: String,
+    val id: String,
+    val service: String,
+    val user: String,
+    val title: String,
+    private val tags: JsonElement? = null,
     private val added: String? = null,
     private val published: String? = null,
     private val edited: String? = null,
     private val file: PawchiveFileDto? = null,
     private val attachments: List<PawchiveFileDto> = emptyList(),
 ) {
+    /** Tags are optional and parsed leniently so an unexpected shape never breaks chapter loading. */
+    val tagList: List<String>
+        get() = (tags as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            .orEmpty()
+
     val images: List<String>
         get() = (listOfNotNull(file) + attachments)
             .filter { it.path.isNotBlank() && it.path.substringAfterLast('.').lowercase() in validImageExtensions }
@@ -113,6 +123,7 @@ class PawchivePostCardDto(
     val id: String,
     val title: String,
     val thumbnail: String?,
+    val info: String,
 ) {
     companion object {
         fun from(element: Element): PawchivePostCardDto? {
@@ -123,7 +134,8 @@ class PawchivePostCardDto(
             val thumbnail = element.selectFirst("img.post-card__image")
                 ?.absUrl("src")
                 ?.takeIf { it.isNotBlank() }
-            return PawchivePostCardDto(service, user, id, title, thumbnail)
+            val info = element.selectFirst("footer")?.text().orEmpty()
+            return PawchivePostCardDto(service, user, id, title, thumbnail, info)
         }
     }
 }
