@@ -1,14 +1,10 @@
 package eu.kanade.tachiyomi.extension.all.pawchive
 
-import eu.kanade.tachiyomi.extension.all.pawchive.PawchiveCreatorDto.Companion.serviceName
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.double
 import kotlin.time.Instant
 
@@ -16,7 +12,6 @@ import kotlin.time.Instant
 class PawchiveFavoritesDto(
     val id: String,
     val faved_seq: Long,
-    val service: String? = null,
 )
 
 @Serializable
@@ -58,33 +53,20 @@ class PawchivePostDto(
     val service: String,
     val user: String,
     val title: String,
+    val content: String? = null,
     private val added: String? = null,
     private val published: String? = null,
     private val edited: String? = null,
     private val file: PawchiveFileDto? = null,
     private val attachments: List<PawchiveFileDto> = emptyList(),
-    private val tags: JsonElement? = null,
 ) {
-    private val allFiles
-        get() = (listOfNotNull(file) + attachments)
-            .filter { it.path.isNotBlank() }
-            .distinctBy { it.path }
+    val postUrl get() = "/$service/user/$user/post/$id"
 
     val images: List<String>
-        get() = allFiles.filter { it.extension in validImageExtensions }.map { it.path }
-
-    val videoCount: Int
-        get() = allFiles.count { it.extension in validVideoExtensions }
-
-    // The field is not documented; accept both a JSON array and a comma separated string.
-    val tagList: List<String>
-        get() = when (tags) {
-            is JsonArray -> tags.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty) }
-            is JsonPrimitive -> tags.contentOrNull?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
-            else -> emptyList()
-        }
-
-    val displayTitle get() = title.ifBlank { "Post $id" }
+        get() = (listOfNotNull(file) + attachments)
+            .filter { it.path.isNotBlank() && it.path.substringAfterLast('.').lowercase() in validImageExtensions }
+            .distinctBy { it.path }
+            .map { it.toString() }
 
     fun toSChapter(serviceName: String?, datePref: String) = SChapter.create().apply {
         val dateStr = when (datePref) {
@@ -102,14 +84,9 @@ class PawchivePostDto(
             Instant.parseOrNull(dateWithTz)?.toEpochMilliseconds()
         } ?: 0L
 
-        url = "/$service/user/$user/post/$id"
+        url = postUrl
         date_upload = postDate
-
-        scanlator = buildList {
-            add("${images.size} img")
-            if (videoCount > 0) add("$videoCount vid")
-            tagList.take(3).forEach { add("#$it") }
-        }.joinToString(" · ")
+        chapter_number = 1f
 
         name = title.ifBlank {
             val postDateString = if (postDate != 0L && dateStr != null) {
@@ -122,34 +99,23 @@ class PawchivePostDto(
         }
     }
 
-    /** A single post as its own entry, used by post search, URL opening and related posts. */
-    fun toSManga(baseUrl: String, thumbBase: String, creator: PawchiveCreatorDto?) = SManga.create().apply {
-        val creatorName = creator?.name ?: user
-        url = "/$service/user/$user/post/$id"
-        title = displayTitle
-        author = creatorName
-        artist = service.serviceName()
-        genre = tagList.joinToString(", ") { "#$it" }.ifEmpty { null }
-        status = SManga.COMPLETED
-        thumbnail_url = images.firstOrNull()?.let { "$thumbBase/thumbnail/data$it" }
-        description = buildString {
-            append("Creator: $creatorName (${service.serviceName()})\n")
-            append("Creator page: $baseUrl/$service/user/$user\n")
-            append("Images: ${images.size}")
-            if (videoCount > 0) append(" · Videos (not viewable here): $videoCount")
-        }
-        initialized = true
-    }
-
     companion object {
         private val validImageExtensions = setOf("png", "jpg", "gif", "jpeg", "webp")
-        private val validVideoExtensions = setOf("mp4", "webm", "mov", "m4v", "mkv")
     }
 }
 
 @Serializable
 class PawchiveFileDto(val path: String = "") {
-    val extension get() = path.substringAfterLast('.').lowercase()
-
     override fun toString() = path
 }
+
+@Serializable
+class PawchiveProfileDto(
+    val name: String,
+)
+
+@Serializable
+class PawchiveTagDto(
+    val tag: String,
+    val post_count: Int = 0,
+)

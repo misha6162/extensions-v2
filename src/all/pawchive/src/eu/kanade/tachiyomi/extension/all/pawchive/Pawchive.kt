@@ -16,6 +16,7 @@ import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
+import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.Dispatchers
@@ -23,16 +24,19 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.CacheControl
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import kotlin.io.use
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.serialization.json.add as addJson
 
 @Source
 abstract class Pawchive :
@@ -103,14 +107,15 @@ abstract class Pawchive :
     // ============================== Search ===============================
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        when (filters.firstInstanceOrNull<ModeFilter>()?.state ?: 0) {
+            1 -> return searchPosts(page, query, filters, popular = false)
+            2 -> return searchPosts(page, query, filters, popular = true)
+        }
+
         var sort: Pair<String, String> = "" to ""
         val typeIncluded = mutableListOf<String>()
         val typeExcluded = mutableListOf<String>()
         var fav: Boolean? = null
-        var postsMode = false
-        var aiMode = 0
-        var popularPeriod = 0
-        val tags = linkedSetOf<String>()
 
         filters.forEach { filter ->
             when (filter) {
@@ -128,24 +133,8 @@ abstract class Pawchive :
                         else -> null
                     }
                 }
-                is SearchModeFilter -> postsMode = filter.state == 1
-                is AiFilter -> aiMode = filter.state
-                is PopularPeriodFilter -> popularPeriod = filter.state
-                is TagSelectFilter -> filter.value?.let(tags::add)
-                is TagTextFilter -> filter.state.split(',').map { it.trim() }.filter { it.isNotEmpty() }.forEach(tags::add)
                 else -> {}
             }
-        }
-
-        // Profile genre chips are shown as "#tag", so tapping one lands here.
-        var text = query.trim()
-        if (text.startsWith("#")) {
-            text.removePrefix("#").trim().takeIf { it.isNotEmpty() }?.let(tags::add)
-            text = ""
-        }
-
-        if (postsMode || tags.isNotEmpty() || popularPeriod > 0) {
-            return searchPosts(page, text, tags, aiMode, popularPeriod)
         }
 
         if (sort.first.isEmpty()) {
@@ -170,7 +159,17 @@ abstract class Pawchive :
                 }
             }
 
-            val creatorsDeferred = async(Dispatchers.IO) { fetchCreators() }
+            val creatorsDeferred = async(Dispatchers.IO) {
+                val url = "$baseUrl/$apiPath/creators"
+                val cacheControl = CacheControl.Builder().maxStale(30.minutes).build()
+
+                apiClient.get(url, cacheControl).use { response ->
+                    if (!response.isSuccessful) {
+                        throw Exception("HTTP error ${response.code}")
+                    }
+                    response.parseAs<List<PawchiveCreatorDto>>()
+                }
+            }
 
             val favorites = favoritesDeferred.await()
             val allCreators = creatorsDeferred.await()
@@ -179,10 +178,9 @@ abstract class Pawchive :
                 val sName = creator.service.serviceName().lowercase()
                 val includeType = typeIncluded.isEmpty() || typeIncluded.contains(sName)
                 val excludeType = typeExcluded.isNotEmpty() && typeExcluded.contains(sName)
-                val regularSearch = creator.name.contains(text, true)
+                val regularSearch = creator.name.contains(query, true)
 
-                // Ids are only unique per service, so match both when the API tells us the service.
-                val favEntry = favorites.find { f -> f.id == creator.id && (f.service == null || f.service == creator.service) }
+                val favEntry = favorites.find { f -> f.id == creator.id }
                 creator.fav = favEntry?.faved_seq ?: 0L
 
                 val isFavorited = when (fav) {
@@ -199,10 +197,6 @@ abstract class Pawchive :
             "pop" -> if (sort.second == "desc") mangas.sortedByDescending { it.favorited } else mangas.sortedBy { it.favorited }
             "tit" -> if (sort.second == "desc") mangas.sortedByDescending { it.name.lowercase() } else mangas.sortedBy { it.name.lowercase() }
             "new" -> if (sort.second == "desc") mangas.sortedByDescending { it.id.toLongOrNull() ?: 0L } else mangas.sortedBy { it.id.toLongOrNull() ?: 0L }
-            "serv" -> {
-                val byService = compareBy<PawchiveCreatorDto>({ it.service }, { it.name.lowercase() })
-                if (sort.second == "desc") mangas.sortedWith(byService.reversed()) else mangas.sortedWith(byService)
-            }
             "fav" -> {
                 if (fav != true) throw Exception("Please check 'Favorites Only' Filter")
                 if (sort.second == "desc") mangas.sortedByDescending { it.fav } else mangas.sortedBy { it.fav }
@@ -224,77 +218,77 @@ abstract class Pawchive :
         return MangasPage(final, hasNextPage)
     }
 
-    // Posts are scraped from the HTML listing: it is the only place where the `q`, `tag`,
-    // `hide`/`only` (AI filter) and popular parameters are known to work.
-    private suspend fun searchPosts(page: Int, query: String, tags: Collection<String>, ai: Int, period: Int): MangasPage {
-        val offset = (page - 1) * PAGE_POST_LIMIT
-        val base = if (period > 0) "$baseUrl/posts/popular" else "$baseUrl/posts"
+    private suspend fun searchPosts(page: Int, query: String, filters: FilterList, popular: Boolean): MangasPage {
+        val urlBuilder = "$baseUrl/posts${if (popular) "/popular" else ""}".toHttpUrl().newBuilder()
 
-        val url = base.toHttpUrl().newBuilder().apply {
-            if (period > 0) addQueryParameter("period", POPULAR_PERIODS[period])
-            // The site rejects queries shorter than 2 characters.
-            if (query.length >= 2) addQueryParameter("q", query)
-            tags.forEach { addQueryParameter("tag", it) }
-            when (ai) {
-                1 -> addQueryParameter("hide", "ai")
-                2 -> addQueryParameter("only", "ai")
-            }
-            if (offset > 0) addQueryParameter("o", offset.toString())
-        }.build()
+        if (query.isNotBlank()) urlBuilder.addQueryParameter("q", query.trim())
 
-        val document = apiClient.get(url.toString()).asJsoup()
+        val customTag = filters.firstInstanceOrNull<CustomTagFilter>()?.state?.trim().orEmpty()
+        val tag = customTag.ifEmpty { filters.firstInstanceOrNull<TagFilter>()?.getValue().orEmpty() }
+        if (tag.isNotEmpty()) urlBuilder.addQueryParameter("tag", tag)
 
-        val mangas = document.select("article.post-card").mapNotNull { card ->
-            val link = card.selectFirst("a.image-link") ?: return@mapNotNull null
-            SManga.create().apply {
-                setUrlWithoutDomain(link.absUrl("href"))
-                title = card.selectFirst(".post-card__header")?.text()?.takeIf { it.isNotBlank() }
-                    ?: "Post ${card.attr("data-id")}"
-                thumbnail_url = card.selectFirst("img.post-card__image")?.absUrl("src")
-                artist = card.attr("data-service").serviceName()
-                status = SManga.COMPLETED
-            }
+        when (filters.firstInstanceOrNull<AiFilter>()?.state ?: 0) {
+            1 -> urlBuilder.addQueryParameter("hide", "ai")
+            2 -> urlBuilder.addQueryParameter("only", "ai")
         }
 
-        return MangasPage(mangas, document.selectFirst("a.next") != null)
+        if (popular) {
+            val period = filters.firstInstanceOrNull<PeriodFilter>()?.getValue() ?: "recent"
+            urlBuilder.addQueryParameter("period", period)
+        }
+
+        val offset = (page - 1) * PAGE_POST_LIMIT
+        if (offset > 0) urlBuilder.addQueryParameter("o", offset.toString())
+
+        val document = apiClient.get(urlBuilder.build()).asJsoup()
+
+        return MangasPage(document.toPostMangas(), document.selectFirst(".paginator a.next") != null)
     }
+
+    private fun Document.toPostMangas(): List<SManga> = select("article.post-card").map { card ->
+        val service = card.attr("data-service")
+        val id = card.attr("data-id")
+        SManga.create().apply {
+            url = "/$service/user/${card.attr("data-user")}/post/$id"
+            title = card.selectFirst(".post-card__header")?.text().orEmpty().ifBlank { "Post $id" }
+            thumbnail_url = card.selectFirst("img.post-card__image")?.absUrl("src")
+            author = service.serviceName()
+        }
+    }.distinctBy { it.url }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) {
             return null
         }
 
-        // /{service}/user/{id}[/post/{postId}]
         val segments = url.pathSegments
-        if (segments.size < 3 || segments[1] != "user" || segments[2].isBlank()) {
+        if (segments.size < 3 || segments[1] != "user") {
             return null
         }
+
         val service = segments[0]
-        val userId = segments[2]
+        val creatorId = segments[2]
 
         if (segments.size >= 5 && segments[3] == "post") {
-            val post = apiClient.get("$baseUrl/$apiPath/$service/user/$userId/post/${segments[4]}", ensureSuccess = false).use { response ->
+            val post = apiClient.get("$baseUrl/$apiPath/$service/user/$creatorId/post/${segments[4]}", ensureSuccess = false).use { response ->
                 if (!response.isSuccessful) return null
                 response.parseAs<PawchivePostDto>()
             }
-            return post.toSManga(baseUrl, imgUrl, findCreator(service, userId))
+            return post.toSManga()
         }
 
-        return findCreator(service, userId)?.toSManga(baseUrl)
-    }
+        val cache = CacheControl.Builder().maxStale(30.minutes).build()
+        val creatorsUrl = "$baseUrl/$apiPath/creators"
 
-    private suspend fun fetchCreators(): List<PawchiveCreatorDto> {
-        val cacheControl = CacheControl.Builder().maxStale(30.minutes).build()
-
-        return apiClient.get("$baseUrl/$apiPath/creators", cacheControl).use { response ->
+        return apiClient.get(creatorsUrl, cache, ensureSuccess = false).use { response ->
             if (!response.isSuccessful) {
-                throw Exception("HTTP error ${response.code}")
+                return null
             }
-            response.parseAs<List<PawchiveCreatorDto>>()
+            val allCreators = response.parseAs<List<PawchiveCreatorDto>>()
+            val creator = allCreators.find { it.id == creatorId && it.service == service } ?: return null
+            creator.toSManga(baseUrl)
         }
     }
-
-    private suspend fun findCreator(service: String, id: String): PawchiveCreatorDto? = fetchCreators().find { it.id == id && it.service == service }
 
     // ============================== Details ==============================
 
@@ -305,72 +299,35 @@ abstract class Pawchive :
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate = if (manga.url.contains("/post/")) {
-        fetchPostUpdate(manga, chapters, fetchDetails, fetchChapters)
-    } else {
-        fetchCreatorUpdate(manga, chapters, fetchDetails, fetchChapters)
-    }
-
-    private suspend fun fetchPostUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
     ): SMangaUpdate {
-        val post: PawchivePostDto = apiClient.get("$baseUrl/$apiPath${manga.url}").parseAs()
-
-        val details = if (fetchDetails) {
-            post.toSManga(baseUrl, imgUrl, findCreator(post.service, post.user))
-        } else {
-            manga
+        if (manga.url.contains("/post/")) {
+            return fetchPostUpdate(manga, chapters, fetchDetails, fetchChapters)
         }
 
         val updatedChapters = if (fetchChapters) {
-            val datePref = preferences.getString(POST_DATE_PREF, POST_DATE_PUBLISHED)!!
-            listOf(
-                post.toSChapter(post.service.serviceName(), datePref).apply { chapter_number = 1f },
-            )
-        } else {
-            chapters
-        }
-
-        return SMangaUpdate(details, updatedChapters)
-    }
-
-    private suspend fun fetchCreatorUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
-    ): SMangaUpdate {
-        // Tags come from the posts listing, so details need at least the first page.
-        val maxPosts = if (fetchChapters) {
-            preferences.getString(POST_PAGES_PREF, POST_PAGES_DEFAULT)!!
+            val prefMaxPost = preferences.getString(POST_PAGES_PREF, POST_PAGES_DEFAULT)!!
                 .toInt().coerceAtMost(POST_PAGES_MAX) * PAGE_POST_LIMIT
-        } else {
-            PAGE_POST_LIMIT
-        }
 
-        val posts = ArrayList<PawchivePostDto>()
-        var offset = 0
-        var hasNextPage = true
-
-        while (offset < maxPosts && hasNextPage) {
-            val url = "$baseUrl/$apiPath${manga.url}/posts?o=$offset"
-
-            val page: List<PawchivePostDto> = apiClient.get(url).parseAs()
-            posts.addAll(page)
-
-            offset += PAGE_POST_LIMIT
-            hasNextPage = page.size == PAGE_POST_LIMIT
-        }
-
-        val updatedChapters = if (fetchChapters) {
             val datePref = preferences.getString(POST_DATE_PREF, POST_DATE_PUBLISHED)!!
 
-            val result = posts
-                .filter { it.images.isNotEmpty() }
-                .map { it.toSChapter(manga.author, datePref) }
+            var offset = 0
+            var hasNextPage = true
+            val result = ArrayList<SChapter>()
+
+            while (offset < prefMaxPost && hasNextPage) {
+                val url = "$baseUrl/$apiPath${manga.url}/posts?o=$offset"
+
+                val page: List<PawchivePostDto> = apiClient.get(url).parseAs()
+
+                page.forEach { post ->
+                    if (post.images.isNotEmpty()) {
+                        result.add(post.toSChapter(manga.author, datePref))
+                    }
+                }
+
+                offset += PAGE_POST_LIMIT
+                hasNextPage = page.size == PAGE_POST_LIMIT
+            }
 
             // Every post is its own chapter, so it needs a unique chapter number. Otherwise the
             // app's "Skip duplicate chapters" setting groups them all together and only one
@@ -384,55 +341,107 @@ abstract class Pawchive :
             chapters
         }
 
-        val details = if (fetchDetails) manga.withTopTags(posts) else manga
+        val details = if (fetchDetails) {
+            val tags = fetchTags(manga.url)
+            SManga.create().apply {
+                url = manga.url
+                title = manga.title
+                author = manga.author
+                thumbnail_url = manga.thumbnail_url
+                description = buildString {
+                    append(PROMPT)
+                    if (tags.isNotEmpty()) {
+                        append("\n\nTags: ")
+                        append(tags.joinToString(", ") { "${it.tag} (${it.post_count})" })
+                    }
+                }
+                genre = tags.joinToString(", ") { it.tag }
+                initialized = true
+            }
+        } else {
+            manga
+        }
 
         return SMangaUpdate(details, updatedChapters)
     }
 
-    private fun SManga.withTopTags(posts: List<PawchivePostDto>): SManga {
-        val top = posts.flatMap { it.tagList }
-            .groupingBy { it.lowercase() }
-            .eachCount()
-            .entries
-            .sortedByDescending { it.value }
-            .take(TOP_TAGS)
+    private suspend fun fetchPostUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val post: PawchivePostDto = apiClient.get("$baseUrl/$apiPath${manga.url}").parseAs()
+        val creatorPath = manga.url.substringBefore("/post/")
+        val datePref = preferences.getString(POST_DATE_PREF, POST_DATE_PUBLISHED)!!
 
-        if (top.isEmpty()) return this
+        val details = if (fetchDetails) {
+            val creatorName = fetchCreatorName(creatorPath)
+            val tags = fetchTags(creatorPath)
+            SManga.create().apply {
+                url = manga.url
+                title = post.title.ifBlank { manga.title }
+                author = creatorName ?: post.service.serviceName()
+                thumbnail_url = manga.thumbnail_url ?: post.images.firstOrNull()?.let { "$imgUrl/thumbnail/$dataPath$it" }
+                description = buildString {
+                    post.content?.htmlToText()?.takeIf { it.isNotBlank() }?.let { append(it).append("\n\n") }
+                    append("Creator: ").append(creatorName ?: post.user).append(" (").append(post.service.serviceName()).append(")\n")
+                    append("Creator profile: ").append(baseUrl).append(creatorPath).append('\n')
+                    append("Paste that link in the search bar to open the full creator.")
+                    if (tags.isNotEmpty()) {
+                        append("\n\nCreator tags: ")
+                        append(tags.joinToString(", ") { "${it.tag} (${it.post_count})" })
+                    }
+                }
+                genre = tags.joinToString(", ") { it.tag }
+                initialized = true
+            }
+        } else {
+            manga
+        }
 
-        return SManga.create().apply {
-            url = this@withTopTags.url
-            title = this@withTopTags.title
-            author = this@withTopTags.author
-            thumbnail_url = this@withTopTags.thumbnail_url
-            status = this@withTopTags.status
-            genre = top.joinToString(", ") { "#${it.key}" }
-            description = PROMPT + "\n\nTop tags in the ${posts.size} loaded posts: " +
-                top.joinToString(", ") { "${it.key} (${it.value})" }
+        val updatedChapters = if (fetchChapters) {
+            listOf(post.toSChapter(post.service.serviceName(), datePref))
+        } else {
+            chapters
+        }
+
+        return SMangaUpdate(details, updatedChapters)
+    }
+
+    private suspend fun fetchTags(creatorPath: String): List<PawchiveTagDto> {
+        val url = "$baseUrl/$apiPath${creatorPath.substringBefore("/post/")}/tags"
+        return apiClient.get(url, ensureSuccess = false).use { response ->
+            if (response.isSuccessful) {
+                response.parseAs<List<PawchiveTagDto>>().sortedByDescending { it.post_count }.take(TAGS_IN_DETAILS)
+            } else {
+                emptyList()
+            }
         }
     }
 
-    override fun getChapterUrl(chapter: SChapter) = "$baseUrl${chapter.url}"
-
-    // ============================== Related ==============================
-
-    // From a post: the creator plus their latest posts. Only shown by Komikku.
-    override val supportsRelatedMangas get() = true
-
-    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
-        val segments = manga.url.trim('/').split('/')
-        if (segments.size < 5 || segments[3] != "post") return emptyList()
-
-        val service = segments[0]
-        val userId = segments[2]
-        val creator = findCreator(service, userId)
-
-        val posts: List<PawchivePostDto> = apiClient.get("$baseUrl/$apiPath/$service/user/$userId/posts").parseAs()
-
-        return listOfNotNull(creator?.toSManga(baseUrl)) + posts
-            .filter { it.id != segments[4] && it.images.isNotEmpty() }
-            .take(RELATED_POSTS)
-            .map { it.toSManga(baseUrl, imgUrl, creator) }
+    private suspend fun fetchCreatorName(creatorPath: String): String? {
+        val url = "$baseUrl/$apiPath$creatorPath/profile"
+        return apiClient.get(url, ensureSuccess = false).use { response ->
+            if (response.isSuccessful) response.parseAs<PawchiveProfileDto>().name else null
+        }
     }
+
+    private fun PawchivePostDto.toSManga() = SManga.create().apply {
+        url = postUrl
+        title = this@toSManga.title.ifBlank { "Post $id" }
+        author = service.serviceName()
+        thumbnail_url = images.firstOrNull()?.let { "$imgUrl/thumbnail/$dataPath$it" }
+    }
+
+    private fun String.htmlToText(): String {
+        val doc = Jsoup.parse(this)
+        doc.select("br").append("\\n")
+        doc.select("p").prepend("\\n\\n")
+        return doc.text().replace("\\n", "\n").replace(Regex("\n{3,}"), "\n\n").trim()
+    }
+
+    override fun getChapterUrl(chapter: SChapter) = "$baseUrl${chapter.url}"
 
     // =============================== Pages ===============================
 
@@ -441,6 +450,10 @@ abstract class Pawchive :
 
         apiClient.get(url).use { response ->
             val postData: PawchivePostDto = response.parseAs()
+
+            if (postData.images.isEmpty()) {
+                throw Exception("This post has no image files (videos and other attachments are not supported)")
+            }
 
             val useLowRes = preferences.getBoolean(USE_LOW_RES_IMG, false)
 
@@ -460,12 +473,11 @@ abstract class Pawchive :
 
     override suspend fun fetchFilterData(): JsonElement {
         val document = apiClient.get("$baseUrl/posts/tags").asJsoup()
-
-        val names = document.select("#tag-container article a")
-            .mapNotNull { it.selectFirst("span")?.text()?.trim()?.takeIf(String::isNotEmpty) }
+        val tags = document.select("#tag-container article a")
+            .mapNotNull { it.absUrl("href").toHttpUrlOrNull()?.queryParameter("tag") }
             .take(TAG_FILTER_LIMIT)
-
-        return buildJsonArray { names.forEach { addJson(it) } }
+        check(tags.isNotEmpty()) { "No tags found" }
+        return buildJsonArray { tags.forEach { add(JsonPrimitive(it)) } }
     }
 
     override fun getFilterList(data: JsonElement?): FilterList {
@@ -523,11 +535,8 @@ abstract class Pawchive :
         private const val PAGE_POST_LIMIT = 50
         private const val PAGE_CREATORS_LIMIT = 50
         private const val TAG_FILTER_LIMIT = 150
-        private const val TOP_TAGS = 25
-        private const val RELATED_POSTS = 20
+        private const val TAGS_IN_DETAILS = 15
         const val PROMPT = "You can change how many posts to load in the extension preferences."
-
-        private val POPULAR_PERIODS = listOf("", "day", "week", "month")
 
         private const val POST_PAGES_PREF = "POST_PAGES"
         private const val POST_PAGES_DEFAULT = "1"

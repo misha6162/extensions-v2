@@ -24,17 +24,19 @@ class SortFilter(name: String, selection: Selection, private val vals: List<Pair
     fun getValue() = vals[state!!.index].second
 }
 
-class SearchModeFilter : Filter.Select<String>("Search in", arrayOf("Creators", "Posts"))
+class ModeFilter : Filter.Select<String>("Browse", arrayOf("Creators", "Posts", "Popular posts"))
 
-class AiFilter : Filter.Select<String>("AI-generated posts", arrayOf("Show", "Hide", "Only"))
-
-class PopularPeriodFilter : Filter.Select<String>("Popular posts", arrayOf("Off", "Day", "Week", "Month"))
-
-class TagSelectFilter(tags: List<String>) : Filter.Select<String>("Popular tags", (listOf("Any") + tags).toTypedArray()) {
-    val value: String? get() = if (state > 0) values[state] else null
+class TagFilter(tags: List<String>) : Filter.Select<String>("Tag", arrayOf("Any") + tags.toTypedArray()) {
+    fun getValue(): String? = if (state == 0) null else values[state]
 }
 
-class TagTextFilter : Filter.Text("Tags (comma separated)")
+class CustomTagFilter : Filter.Text("Custom tag (overrides list)")
+
+class AiFilter : Filter.Select<String>("AI-generated", arrayOf("Show", "Hide", "Only"))
+
+class PeriodFilter : Filter.Select<String>("Popular period", arrayOf("Recent", "Day", "Week", "Month")) {
+    fun getValue(): String = values[state].lowercase()
+}
 
 fun getLatestUpdatesFilterList(): FilterList = FilterList(
     SortFilter("Sort by", Filter.Sort.Selection(2, false), getSortsList),
@@ -43,16 +45,18 @@ fun getLatestUpdatesFilterList(): FilterList = FilterList(
 )
 
 fun getDefaultFilterList(tags: List<String> = emptyList()): FilterList = FilterList(
-    buildList<Filter<*>> {
-        add(SortFilter("Sort by", Filter.Sort.Selection(0, false), getSortsList))
-        add(TypeFilter("Types", getTypes))
-        add(FavoritesFilter())
-        add(Filter.Separator())
-        add(Filter.Header("Post search: the options below only apply to posts. Choosing a tag, a popular period or typing '#tag' switches to posts automatically."))
-        add(SearchModeFilter())
-        add(AiFilter())
-        if (tags.isNotEmpty()) add(TagSelectFilter(tags))
-        add(TagTextFilter())
-        add(PopularPeriodFilter())
-    },
+    ModeFilter(),
+    Filter.Separator(),
+    Filter.Header("Creators mode"),
+    SortFilter("Sort by", Filter.Sort.Selection(0, false), getSortsList),
+    TypeFilter("Types", getTypes),
+    FavoritesFilter(),
+    Filter.Separator(),
+    Filter.Header("Posts / Popular posts mode"),
+    TagFilter(tags),
+    CustomTagFilter(),
+    AiFilter(),
+    Filter.Separator(),
+    Filter.Header("Popular posts mode"),
+    PeriodFilter(),
 )
