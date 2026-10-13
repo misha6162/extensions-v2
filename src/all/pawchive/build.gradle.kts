@@ -14,8 +14,4 @@ keiyoushi {
         lang = "all"
         baseUrl = "https://pawchive.pw"
     }
-
-    deeplink {
-        path("/..*/user/..*")
-    }
 }
